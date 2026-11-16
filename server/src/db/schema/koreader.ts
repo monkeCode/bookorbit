@@ -315,6 +315,7 @@ export const koreaderPageStats = pgTable(
   (t) => [
     uniqueIndex('kps_user_file_device_page_start_uidx').on(t.userId, t.bookFileId, t.deviceId, t.page, t.startTime),
     index('kps_user_file_device_start_idx').on(t.userId, t.bookFileId, t.deviceId, t.startTime),
+    index('kps_user_file_start_page_idx').on(t.userId, t.bookFileId, t.startTime, t.page),
     index('kps_user_id_idx').on(t.userId),
     index('koreader_page_stats_book_file_id_idx').on(t.bookFileId),
     check('koreader_page_stats_duration_nonnegative_chk', sql`${t.durationSeconds} >= 0`),

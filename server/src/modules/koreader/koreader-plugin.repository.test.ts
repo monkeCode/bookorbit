@@ -26,6 +26,7 @@ function makeInsertChain(result: unknown) {
     },
   };
   chain.values = vi.fn().mockReturnValue(chain);
+  chain.onConflictDoNothing = vi.fn().mockReturnValue(chain);
   chain.onConflictDoUpdate = vi.fn().mockReturnValue(chain);
   chain.returning = vi.fn().mockReturnValue(chain);
   return chain;
@@ -35,7 +36,9 @@ function makeDb() {
   return {
     execute: vi.fn(),
     select: vi.fn(),
+    selectDistinct: vi.fn(),
     insert: vi.fn(),
+    transaction: vi.fn(),
   };
 }
 
@@ -47,6 +50,70 @@ describe('KoreaderPluginRepository', () => {
     db = makeDb();
     const module = await Test.createTestingModule({ providers: [KoreaderPluginRepository, { provide: DB, useValue: db }] }).compile();
     repo = module.get(KoreaderPluginRepository);
+    db.transaction.mockImplementation((callback: (tx: typeof db) => unknown) => callback(db));
+  });
+
+  describe('ingestAndDeriveForBook cross-device echoes', () => {
+    const event = { page: 12, startTime: 1_780_000_000, durationSeconds: 60, totalPages: 300 };
+    const params = { userId: 7, bookFileId: 10, bookId: 20, libraryId: 1, deviceId: 'device-B', timeZone: 'UTC' };
+
+    it('acknowledges exact foreign rows without creating sessions or changing history', async () => {
+      db.selectDistinct.mockReturnValue(makeQueryChain([event]));
+      await expect(repo.ingestAndDeriveForBook({ ...params, events: [event] })).resolves.toEqual({
+        accepted: 0,
+        duplicates: 1,
+        insertedSessions: [],
+        updatedSessions: [],
+        deletedSessions: 0,
+      });
+      expect(db.execute).toHaveBeenCalledTimes(1);
+      expect(db.insert).not.toHaveBeenCalled();
+      expect(db.select).not.toHaveBeenCalled();
+      expect(db.execute.mock.invocationCallOrder[0]).toBeLessThan(db.selectDistinct.mock.invocationCallOrder[0]!);
+    });
+
+    it.each(['page', 'startTime', 'durationSeconds', 'totalPages'] as const)('keeps new events differing in %s', async (field) => {
+      const fresh = { ...event, [field]: event[field] + 1 };
+      db.selectDistinct.mockReturnValue(makeQueryChain([event]));
+      // An already stored same-device key can still conflict at insertion.
+      const insert = makeInsertChain([]);
+      db.insert.mockReturnValue(insert);
+      await expect(repo.ingestAndDeriveForBook({ ...params, events: [event, fresh] })).resolves.toMatchObject({ accepted: 0, duplicates: 2 });
+      expect(insert.values).toHaveBeenCalledWith([{ userId: 7, bookFileId: 10, deviceId: 'device-B', ...fresh }]);
+    });
+
+    it('keeps the existing same-device uniqueness check when no foreign row matches', async () => {
+      db.selectDistinct.mockReturnValue(makeQueryChain([]));
+      const insert = makeInsertChain([]);
+      db.insert.mockReturnValue(insert);
+      await expect(repo.ingestAndDeriveForBook({ ...params, events: [event] })).resolves.toMatchObject({ accepted: 0, duplicates: 1 });
+      expect(insert.values).toHaveBeenCalledWith([{ userId: 7, bookFileId: 10, deviceId: 'device-B', ...event }]);
+      expect(insert.onConflictDoNothing).toHaveBeenCalledOnce();
+    });
+
+    it('does not issue a VALUES query for an empty batch', async () => {
+      await expect(repo.ingestAndDeriveForBook({ ...params, events: [] })).resolves.toMatchObject({ accepted: 0, duplicates: 0 });
+      expect(db.selectDistinct).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('scopes the exact-row lookup to the authenticated user, file and a different device', async () => {
+      const captured = createCapturingDb();
+      const transactional = {
+        ...captured.db,
+        transaction: (callback: (tx: typeof captured.db) => unknown) => callback(captured.db),
+      };
+      const module = await Test.createTestingModule({ providers: [KoreaderPluginRepository, { provide: DB, useValue: transactional }] }).compile();
+      // The capturing DB returns no inserted rows, so derivation must not run.
+      await module.get(KoreaderPluginRepository).ingestAndDeriveForBook({ ...params, events: [event] });
+      const lookup = captured.queries.find((query) => query.sql.includes('incoming'))!;
+      expect(lookup.sql).toContain('select distinct');
+      expect(lookup.sql).toContain('"koreader_page_stats"."user_id" =');
+      expect(lookup.sql).toContain('"koreader_page_stats"."book_file_id" =');
+      expect(lookup.sql).toContain('"koreader_page_stats"."device_id" <>');
+      for (const field of ['page', 'start_time', 'duration_seconds', 'total_pages']) expect(lookup.sql).toContain(`incoming.${field}`);
+      expect(lookup.params).toEqual([event.page, event.startTime, event.durationSeconds, event.totalPages, 7, 10, 'device-B']);
+    });
   });
 
   describe('getPluginTotals', () => {

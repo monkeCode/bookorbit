@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, gt, gte, inArray, like, lt, lte, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, gte, inArray, like, lt, lte, ne, sql } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
 import { DB } from '../../db';
@@ -58,10 +58,51 @@ export class KoreaderPluginRepository {
 
     return this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`koreader-stats:${userId}:${bookFileId}`}, 0))`);
+      if (events.length === 0) {
+        return { accepted: 0, duplicates: 0, insertedSessions: [], updatedSessions: [], deletedSessions: 0 };
+      }
+
+      // Statistics synchronization can copy a device's raw rows into another device's
+      // database. Match the complete raw row, not interval or progress overlap. Keep
+      // this check under the existing user/file lock so concurrent uploads agree.
+      const candidates = sql.join(
+        events.map((event) => sql`(${event.page}::int, ${event.startTime}::bigint, ${event.durationSeconds}::int, ${event.totalPages}::int)`),
+        sql`, `,
+      );
+      const echoes = await tx
+        .selectDistinct({
+          page: schema.koreaderPageStats.page,
+          startTime: schema.koreaderPageStats.startTime,
+          durationSeconds: schema.koreaderPageStats.durationSeconds,
+          totalPages: schema.koreaderPageStats.totalPages,
+        })
+        .from(schema.koreaderPageStats)
+        .innerJoin(
+          sql`(values ${candidates}) as incoming(page, start_time, duration_seconds, total_pages)`,
+          and(
+            eq(schema.koreaderPageStats.page, sql`incoming.page`),
+            eq(schema.koreaderPageStats.startTime, sql`incoming.start_time`),
+            eq(schema.koreaderPageStats.durationSeconds, sql`incoming.duration_seconds`),
+            eq(schema.koreaderPageStats.totalPages, sql`incoming.total_pages`),
+          ),
+        )
+        .where(
+          and(
+            eq(schema.koreaderPageStats.userId, userId),
+            eq(schema.koreaderPageStats.bookFileId, bookFileId),
+            ne(schema.koreaderPageStats.deviceId, deviceId),
+          ),
+        );
+      const fingerprint = (event: KoreaderPageEvent) => JSON.stringify([event.page, event.startTime, event.durationSeconds, event.totalPages]);
+      const echoKeys = new Set(echoes.map(fingerprint));
+      const freshEvents = events.filter((event) => !echoKeys.has(fingerprint(event)));
+      if (freshEvents.length === 0) {
+        return { accepted: 0, duplicates: events.length, insertedSessions: [], updatedSessions: [], deletedSessions: 0 };
+      }
       const inserted = await tx
         .insert(schema.koreaderPageStats)
         .values(
-          events.map((event) => ({
+          freshEvents.map((event) => ({
             userId,
             bookFileId,
             deviceId,

@@ -207,6 +207,76 @@ describe('KOReader page stats derivation (e2e)', { timeout: 180_000 }, () => {
     expect(surviving.map((row) => row.sessionId)).toEqual([buildSessionId(deviceB, epub.bookFileId, base)]);
   });
 
+  it.each(['forward', 'reverse', 'concurrent'])('counts copied page events only once across devices (%s)', async (order) => {
+    const base = BASE_EPOCH + 10_000_000 + ['forward', 'reverse', 'concurrent'].indexOf(order) * 100_000;
+    const events = cluster(base, 10, 1);
+    const devices = [`echo-${order}-A`, `echo-${order}-B`];
+    const dailySeconds = async () => {
+      const rows = await ctx.db
+        .select({ seconds: schema.userReadingDailyStats.readingSeconds })
+        .from(schema.userReadingDailyStats)
+        .where(eq(schema.userReadingDailyStats.userId, ownerId));
+      return rows.reduce((sum, row) => sum + row.seconds, 0);
+    };
+    const before = await dailySeconds();
+    const ordered = order === 'reverse' ? [...devices].reverse() : devices;
+    const results =
+      order === 'concurrent'
+        ? await Promise.all(ordered.map((device) => uploadPageStats(events, undefined, device)))
+        : [await uploadPageStats(events, undefined, ordered[0]), await uploadPageStats(events, undefined, ordered[1])];
+    expect(results.map((result) => result.results[0]!.accepted).sort((a, b) => a - b)).toEqual([0, 10]);
+    expect(results.map((result) => result.results[0]!.duplicates).sort((a, b) => a - b)).toEqual([0, 10]);
+
+    for (const device of devices) {
+      expect((await uploadPageStats(events, undefined, device)).results[0]).toMatchObject({ accepted: 0, duplicates: 10 });
+    }
+    const rows = await ctx.db
+      .select()
+      .from(schema.readingSessions)
+      .where(
+        and(
+          eq(schema.readingSessions.userId, ownerId),
+          eq(schema.readingSessions.bookFileId, epub.bookFileId),
+          eq(schema.readingSessions.startedAt, new Date(base * 1000)),
+        ),
+      );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.source).toBe('koreader');
+    expect(rows[0]!.durationSeconds).toBe(550);
+    expect((await dailySeconds()) - before).toBe(550);
+  });
+
+  it('accepts fresh reading in a batch containing copied rows', async () => {
+    const base = BASE_EPOCH + 11_000_000;
+    const copied = cluster(base, 10, 1);
+    const fresh = cluster(base + 600, 5, 11);
+    await uploadPageStats(copied, undefined, 'mixed-echo-A');
+    expect((await uploadPageStats([...copied, ...fresh], undefined, 'mixed-echo-B')).results[0]).toMatchObject({ accepted: 5, duplicates: 10 });
+    const rows = await ctx.db
+      .select()
+      .from(schema.koreaderPageStats)
+      .where(
+        and(
+          eq(schema.koreaderPageStats.userId, ownerId),
+          eq(schema.koreaderPageStats.bookFileId, epub.bookFileId),
+          eq(schema.koreaderPageStats.deviceId, 'mixed-echo-B'),
+        ),
+      );
+    expect(rows).toHaveLength(5);
+  });
+
+  it('keeps same-time events with different page layouts or durations independent', async () => {
+    const base = BASE_EPOCH + 12_000_000;
+    const event = { page: 1, startTime: base, durationSeconds: 55, totalPages: TOTAL_PAGES };
+    await uploadPageStats([event], undefined, 'distinct-row-A');
+    for (const [index, changes] of [{ page: 2 }, { durationSeconds: 56 }, { totalPages: TOTAL_PAGES + 1 }].entries()) {
+      expect((await uploadPageStats([{ ...event, ...changes }], undefined, `distinct-row-${index}`)).results[0]).toMatchObject({
+        accepted: 1,
+        duplicates: 0,
+      });
+    }
+  });
+
   it('upgrades a conflated legacy session from complete raw device clusters without double counting', async () => {
     const base = BASE_EPOCH + 2_000_000;
     const devices = ['legacy-prefix-A', 'legacy-prefix-B'];
